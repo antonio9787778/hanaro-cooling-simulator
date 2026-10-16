@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from datetime import datetime
 
 # 페이지 기본 설정
 st.set_page_config(
@@ -16,7 +17,17 @@ MAX_BASIN_LEVEL = 3.9   # 수조 최대 수위 한계 (m)
 TARGET_BASIN_LEVEL = 3.7 # 권장 목표 수위 (m)
 
 # -----------------------------------------------------------------------------
-# 로직 함수
+# 세션 상태(데이터 저장용) 초기화
+# -----------------------------------------------------------------------------
+if 'history_log' not in st.session_state:
+    # 히스토리 데이터를 저장할 빈 DataFrame 생성
+    st.session_state.history_log = pd.DataFrame(columns=[
+        '시각', '열출력(MW)', '입구온도(℃)', '온도변화율(℃/min)', 
+        '수조수위(m)', '추천팬가동', '팬속도', '보급수밸브(%)', '상태'
+    ])
+
+# -----------------------------------------------------------------------------
+# 제어 및 계산 로직 함수
 # -----------------------------------------------------------------------------
 def calculate_optimal_fans(current_temp, temp_rate):
     """32.0℃ 마진을 준수하며 팬 가동을 최소화하는 알고리즘"""
@@ -77,15 +88,41 @@ st.title("⚛️ 하나로(HANARO) 2차 냉각계통 스마트 최적 제어 시
 st.caption("안전 상한선(32.0℃) 및 수위 한계(3.9m) 조건을 엄격히 지키며 팬 가동을 최소화합니다.")
 
 st.sidebar.header("🎛️ 실시간 상태 제어판 (Input)")
+
+# 원자로 열출력 옵션 수정 (27MW 포함)
+input_power = st.sidebar.select_slider(
+    "원자로 열출력 (MW)", 
+    options=[0, 10, 20, 27, 30], 
+    value=27,
+    help="하나로의 정격 출력(30MW) 및 주요 운전 출력 level(27MW 등) 설정"
+)
+
 input_temp = st.sidebar.slider("열교환기 2차측 입구 온도 (℃)", 25.0, 33.0, 29.5, 0.1)
 input_temp_rate = st.sidebar.slider("온도 변화율 (℃/min)", -0.5, 0.5, 0.05, 0.01)
 input_level = st.sidebar.slider("수조(Basin) 수위 (m)", 3.00, 4.00, 3.68, 0.01)
-input_power = st.sidebar.select_slider("원자로 열출력 (MW)", options=[0, 10, 20, 30], value=30)
 
 # 계산 수행
 fan_info = calculate_optimal_fans(input_temp, input_temp_rate)
 valve_pct, valve_msg = calculate_makeup_valve(input_level)
 margin_left = round(MARGIN_TEMP - input_temp, 2)
+
+# 기록 저장 버튼 기능
+st.sidebar.divider()
+if st.sidebar.button("💾 현재 상태/결과값 기록 저장"):
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    new_data = {
+        '시각': now_str,
+        '열출력(MW)': input_power,
+        '입구온도(℃)': input_temp,
+        '온도변화율(℃/min)': input_temp_rate,
+        '수조수위(m)': input_level,
+        '추천팬가동': f"{fan_info['active_fans']}대",
+        '팬속도': fan_info['speed'],
+        '보급수밸브(%)': valve_pct,
+        '상태': fan_info['status']
+    }
+    st.session_state.history_log = pd.concat([st.session_state.history_log, pd.DataFrame([new_data])], ignore_index=True)
+    st.sidebar.success("기록이 성공적으로 추가되었습니다!")
 
 # KPI 카드 배치
 col1, col2, col3, col4 = st.columns(4)
@@ -100,7 +137,7 @@ with col1:
 
 with col2:
     st.metric(
-        label="추천 팬 가동",
+        label=f"추천 팬 가동 ({input_power}MW)",
         value=f"{fan_info['active_fans']} 대 [{fan_info['speed']}]",
         delta=f"상태: {fan_info['status']}"
     )
@@ -129,6 +166,7 @@ with left_col:
     st.markdown(f"""
     <div style="padding: 15px; border-radius: 10px; background-color: #f0f2f6; border-left: 5px solid {fan_info['color']};">
         <h4>{fan_info['msg']}</h4>
+        <p><b>원자로 출력 상태:</b> {input_power} MW</p>
         <p><b>보급수 제어:</b> {valve_msg}</p>
     </div>
     """, unsafe_allow_html=True)
@@ -150,7 +188,7 @@ with right_col:
         mode = "gauge+number",
         value = input_temp,
         domain = {'x': [0, 1], 'y': [0, 1]},
-        title = {'text': "2차측 입구 온도 (마진: 32.0℃)"},
+        title = {'text': f"2차측 입구 온도 (마진: 32.0℃ / 출력: {input_power}MW)"},
         gauge = {
             'axis': {'range': [25, 34]},
             'bar': {'color': fan_info['color']},
@@ -172,19 +210,27 @@ with right_col:
 
 st.divider()
 
-# 시뮬레이션 타임라인 그래프 예시
-st.subheader("📈 실시간 온도 및 팬 가동 추이 (시뮬레이션 트렌드)")
+# -----------------------------------------------------------------------------
+# 히스토리 저장 로그 표 및 다운로드 영역
+# -----------------------------------------------------------------------------
+st.subheader("📋 입력 및 측정 데이터 기록 (히스토리 로그)")
 
-times = pd.date_range(end=pd.Timestamp.now(), periods=20, freq='min')
-sim_temps = np.linspace(input_temp - 1.5, input_temp, 20)
-sim_levels = np.linspace(input_level - 0.05, input_level, 20)
-
-df = pd.DataFrame({
-    '시간': times,
-    '입구 온도(℃)': sim_temps,
-    '수조 수위(m)': sim_levels,
-    '안전 마진 기준(32℃)': [32.0]*20,
-    '수위 한계(3.9m)': [3.9]*20
-})
-
-st.line_chart(df.set_index('시간')[['입구 온도(℃)', '안전 마진 기준(32℃)']])
+if not st.session_state.history_log.empty:
+    st.dataframe(st.session_state.history_log, use_container_width=True)
+    
+    # CSV 다운로드 기능 제공
+    csv_data = st.session_state.history_log.to_csv(index=False).encode('utf-8-sig')
+    st.download_button(
+        label="📥 누적 데이터 CSV 다운로드",
+        data=csv_data,
+        file_name=f"hanaro_cooling_log_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        mime="text/csv"
+    )
+    
+    # 저장된 기록으로 트렌드 그래프 출력
+    st.write("#### 📈 기록된 데이터의 온도 및 수위 추이")
+    chart_df = st.session_state.history_log.copy()
+    chart_df['32℃ 안전마진'] = 32.0
+    st.line_chart(chart_df.set_index('시각')[['입구온도(℃)', '32℃ 안전마진', '수조수위(m)']])
+else:
+    st.info("왼쪽 사이드바에서 [💾 현재 상태/결과값 기록 저장] 버튼을 누르면 입력 데이터와 제어 결과가 차곡차곡 기록됩니다.")
